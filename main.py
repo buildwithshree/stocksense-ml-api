@@ -27,7 +27,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="StockSense ML API",
     version=settings.model_version,
-    description="Stock price prediction and risk scoring microservice",
+    description="Stock price prediction and risk scoring microservice. "
+            "For educational and research purposes only. "
+            "Not financial advice. Do not use for real investment decisions.",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url=None,

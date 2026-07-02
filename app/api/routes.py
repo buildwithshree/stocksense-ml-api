@@ -170,16 +170,20 @@ def backtest(ticker: str):
 
 def _predict(result, X_scaled, df, feature_cols) -> float:
     """Unified predict call — handles LSTM sequence reshaping if needed."""
-    import torch
     model = result.model
 
     if result.model_name == "LSTM":
-        SEQ_LEN = 30
+        try:
+            import torch
+        except ImportError:
+            raise ValueError("PyTorch not available for LSTM inference")
+
+        SEQ_LEN = min(30, len(df) // 4)
         if len(df) < SEQ_LEN:
             raise ValueError("Not enough data for LSTM prediction sequence")
         seq_features = df[feature_cols].iloc[-SEQ_LEN:].values
         seq_scaled   = result.scaler.transform(seq_features)
-        tensor = torch.FloatTensor(seq_scaled).unsqueeze(0)
+        tensor       = torch.FloatTensor(seq_scaled).unsqueeze(0)
         model.eval()
         with torch.no_grad():
             return float(model(tensor).item())

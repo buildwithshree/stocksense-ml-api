@@ -90,9 +90,14 @@ def train_and_evaluate(
 
     # ── TimeSeriesSplit — NEVER random split on time-series data ─────────────
     # Use 5 splits; evaluate on the last fold (most recent data = test)
-    tscv = TimeSeriesSplit(n_splits=5)
-    splits = list(tscv.split(X))
-    train_idx, test_idx = splits[-1]   # last fold = most recent
+    if len(X) < 6:
+        train_size = max(1, len(X) - 1)
+        train_idx = np.arange(train_size)
+        test_idx = np.arange(train_size, len(X))
+    else:
+        tscv = TimeSeriesSplit(n_splits=5)
+        splits = list(tscv.split(X))
+        train_idx, test_idx = splits[-1]   # last fold = most recent
 
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
@@ -110,7 +115,7 @@ def train_and_evaluate(
     # ── Train ─────────────────────────────────────────────────────────────
     t0 = time.time()
     model, y_pred, importances = _train_model(
-        model_name, X_train_s, y_train, X_test_s, feature_cols
+        model_name, X_train_s, y_train, X_test_s, y_test, feature_cols
     )
     training_ms = int((time.time() - t0) * 1000)
 
@@ -146,7 +151,7 @@ def train_and_evaluate(
     )
 
 
-def _train_model(name, X_train, y_train, X_test, feature_cols):
+def _train_model(name, X_train, y_train, X_test, y_test, feature_cols):
     if name == "LinearRegression":
         m = LinearRegression()
         m.fit(X_train, y_train)
@@ -184,62 +189,59 @@ def _train_model(name, X_train, y_train, X_test, feature_cols):
         return m, pred, imp
 
     elif name == "LSTM":
-        return _train_lstm(X_train, y_train, X_test, feature_cols)
+        return _train_lstm(X_train, y_train, X_test, y_test, feature_cols)
 
     else:
         raise ValueError(f"Unknown model: {name}")
 
 
-def _train_lstm(X_train, y_train, X_test, feature_cols):
+def _train_lstm(X_train, y_train, X_test, y_test, feature_cols):
     import torch
     import torch.nn as nn
 
-    SEQ_LEN = 30
-    HIDDEN  = 64
-    LAYERS  = 2
-    EPOCHS  = 30
-    LR      = 0.001
+    SEQ_LEN = min(30, len(X_train) // 4)
+    HIDDEN   = 64
+    LAYERS   = 2
+    EPOCHS   = 30
+    LR       = 0.001
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if len(X_train) <= SEQ_LEN or len(X_test) <= SEQ_LEN:
+        logger.warning("Not enough rows for LSTM sequences, falling back to XGBoost")
+        return _train_model("XGBoost", X_train, y_train, X_test, y_test, feature_cols)
 
     def make_sequences(X, y, seq_len):
         Xs, ys = [], []
         for i in range(len(X) - seq_len):
-            Xs.append(X[i:i+seq_len])
-            ys.append(y[i+seq_len])
+            Xs.append(X[i : i + seq_len])
+            ys.append(y[i + seq_len])
         return np.array(Xs), np.array(ys)
 
-    if len(X_train) <= SEQ_LEN:
-        # Fallback to XGBoost if not enough rows for LSTM sequences
-        logger.warning("Not enough rows for LSTM sequences, falling back to XGBoost")
-        return _train_model("XGBoost", X_train, y_train, X_test, feature_cols)
-
     X_tr_seq, y_tr_seq = make_sequences(X_train, y_train, SEQ_LEN)
-    X_te_seq, y_te_seq = make_sequences(X_test, y_test if (y_test := y_train[-len(X_test):]) is not None else y_train, SEQ_LEN)
+    X_te_seq, y_te_seq = make_sequences(X_test,  y_test,  SEQ_LEN)
 
-    X_tr_t = torch.FloatTensor(X_tr_seq).to(device)
-    y_tr_t = torch.FloatTensor(y_tr_seq).to(device)
-    X_te_t = torch.FloatTensor(X_te_seq).to(device)
+    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    X_tr_t   = torch.FloatTensor(X_tr_seq).to(device)
+    y_tr_t   = torch.FloatTensor(y_tr_seq).to(device)
+    X_te_t   = torch.FloatTensor(X_te_seq).to(device)
 
     class LSTMModel(nn.Module):
         def __init__(self, input_size, hidden, layers):
             super().__init__()
             self.lstm = nn.LSTM(input_size, hidden, layers, batch_first=True, dropout=0.2)
-            self.fc   = nn.Linear(hidden, 1)
+            self.fc = nn.Linear(hidden, 1)
 
         def forward(self, x):
             out, _ = self.lstm(x)
             return self.fc(out[:, -1, :]).squeeze()
 
-    model = LSTMModel(X_train.shape[1], HIDDEN, LAYERS).to(device)
-    opt   = torch.optim.Adam(model.parameters(), lr=LR)
+    model   = LSTMModel(X_train.shape[1], HIDDEN, LAYERS).to(device)
+    opt     = torch.optim.Adam(model.parameters(), lr=LR)
     loss_fn = nn.MSELoss()
 
     model.train()
-    for epoch in range(EPOCHS):
+    for _ in range(EPOCHS):
         opt.zero_grad()
-        pred = model(X_tr_t)
-        loss = loss_fn(pred, y_tr_t)
+        loss = loss_fn(model(X_tr_t), y_tr_t)
         loss.backward()
         opt.step()
 
@@ -247,13 +249,18 @@ def _train_lstm(X_train, y_train, X_test, feature_cols):
     with torch.no_grad():
         pred_te = model(X_te_t).cpu().numpy()
 
-    # Pad predictions to match X_test length (sequence offset)
     pad = len(X_test) - len(pred_te)
     if pad > 0:
         pred_te = np.concatenate([np.full(pad, pred_te[0]), pred_te])
 
-    # LSTM has no direct feature importance — use gradient-free proxy (zeros → top features unknown)
-    imp = feature_cols[:5]  # top 5 by position as placeholder
+    model.eval()
+    X_sample = torch.FloatTensor(X_tr_seq[-1:]).to(device).requires_grad_(True)
+    output   = model(X_sample)
+    output.sum().backward()
+    grads    = X_sample.grad.abs().mean(dim=1).squeeze().cpu().numpy()
+    ranked   = sorted(zip(feature_cols, grads), key=lambda x: x[1], reverse=True)
+    imp      = [name for name, _ in ranked[:10]]
+
     return model, pred_te, imp
 
 

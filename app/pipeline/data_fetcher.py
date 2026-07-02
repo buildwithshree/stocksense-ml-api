@@ -1,3 +1,4 @@
+import requests
 import logging
 from typing import Tuple
 
@@ -42,7 +43,11 @@ def fetch_ohlcv(ticker: str) -> Tuple[pd.DataFrame, str]:
     # 2. Live fetch
     logger.info("Fetching live OHLCV for %s from yfinance", ticker)
     try:
-        yf_ticker = yf.Ticker(ticker)
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
+        yf_ticker = yf.Ticker(ticker, session=session)
         df = yf_ticker.history(
             period=f"{settings.default_period_years}y",
             interval="1d",
