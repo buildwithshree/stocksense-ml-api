@@ -11,11 +11,13 @@ logger = logging.getLogger(__name__)
 
 SUFFIX_CURRENCY = {".NS": "INR", ".BO": "INR"}
 
+
 def detect_currency(ticker: str) -> str:
     for suffix, currency in SUFFIX_CURRENCY.items():
         if ticker.upper().endswith(suffix):
             return currency
     return "USD"
+
 
 def fetch_ohlcv(ticker: str) -> Tuple[pd.DataFrame, str]:
     ticker = ticker.upper().strip()
@@ -33,7 +35,12 @@ def fetch_ohlcv(ticker: str) -> Tuple[pd.DataFrame, str]:
 
     url = "https://www.alphavantage.co/query"
     params = {
-        "function": "TIME_SERIES_DAILY_ADJUSTED",
+        # NOTE: TIME_SERIES_DAILY_ADJUSTED is a premium-only endpoint on
+        # Alpha Vantage's free tier. TIME_SERIES_DAILY is the free equivalent
+        # and is what this system uses. Prices are NOT split/dividend-adjusted
+        # as a result — acceptable tradeoff for a free-tier data source, but
+        # worth noting as a known limitation if a split occurs mid-window.
+        "function": "TIME_SERIES_DAILY",
         "symbol": av_symbol,
         "outputsize": "full",
         "apikey": settings.alpha_vantage_key,
@@ -49,6 +56,14 @@ def fetch_ohlcv(ticker: str) -> Tuple[pd.DataFrame, str]:
     if "Note" in data:
         raise ValueError("Alpha Vantage rate limit hit. Try again in 1 minute.")
 
+    if "Information" in data:
+        # AV returns this key (HTTP 200, no error status) when a request hits
+        # a premium-only endpoint or the daily/rate quota. Must be checked
+        # explicitly — it does not appear as "Note" or "Error Message".
+        raise ValueError(
+            f"Alpha Vantage rejected request for {ticker}: {data['Information']}"
+        )
+
     if "Error Message" in data:
         raise ValueError(f"Invalid ticker {ticker}: {data['Error Message']}")
 
@@ -63,8 +78,8 @@ def fetch_ohlcv(ticker: str) -> Tuple[pd.DataFrame, str]:
             "Open":   float(vals["1. open"]),
             "High":   float(vals["2. high"]),
             "Low":    float(vals["3. low"]),
-            "Close":  float(vals["5. adjusted close"]),
-            "Volume": int(vals["6. volume"]),
+            "Close":  float(vals["4. close"]),
+            "Volume": int(vals["5. volume"]),
         })
 
     df = pd.DataFrame(rows).set_index("Date").sort_index()
