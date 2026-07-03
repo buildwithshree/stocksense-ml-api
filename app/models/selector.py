@@ -19,12 +19,7 @@ logger = logging.getLogger(__name__)
 
 # LSTM import is lazy — only when actually selected, to keep startup fast
 _LSTM_AVAILABLE = False
-try:
-    import torch
-    import torch.nn as nn
-    _LSTM_AVAILABLE = True
-except ImportError:
-    logger.warning("PyTorch not available — LSTM model disabled")
+
 
 
 @dataclass
