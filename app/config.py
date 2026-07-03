@@ -20,6 +20,6 @@ class Settings(BaseSettings):
     port: int = 8000
     workers: int = 1
 
-    alpha_vantage_key: str = "T6UUZET8RISCTHQ9"
+    alpha_vantage_key: str = ""
 
 settings = Settings()
