@@ -1,12 +1,15 @@
+import io
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+import joblib
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
 from app.config import settings
+from app.models.selector import TrainResult
 
 logger = logging.getLogger(__name__)
 
@@ -125,3 +128,88 @@ def write_backtest_result(result: dict) -> None:
             conn.execute(sql, result)
     except Exception as e:
         logger.error("backtest_results write error: %s", e)
+
+
+def save_model_artifact(ticker: str, result: TrainResult) -> None:
+    """
+    Persist a trained model (scaler + model + metadata, as a single joblib blob)
+    to Postgres. This is what survives a Render free-tier restart — the
+    in-memory ModelCache does not. One row per ticker; a new training run
+    overwrites the old artifact via ON CONFLICT.
+    """
+    buf = io.BytesIO()
+    joblib.dump(result, buf)
+    artifact_bytes = buf.getvalue()
+
+    sql = text("""
+        INSERT INTO model_artifacts
+            (ticker, model_name, model_version, artifact, rmse, mae, r2_score,
+             feature_cols, train_start_date, train_end_date, test_start_date, test_end_date, created_at)
+        VALUES
+            (:ticker, :model_name, :model_version, :artifact, :rmse, :mae, :r2_score,
+             :feature_cols, :train_start_date, :train_end_date, :test_start_date, :test_end_date, NOW())
+        ON CONFLICT (ticker) DO UPDATE
+            SET model_name       = EXCLUDED.model_name,
+                model_version    = EXCLUDED.model_version,
+                artifact         = EXCLUDED.artifact,
+                rmse             = EXCLUDED.rmse,
+                mae              = EXCLUDED.mae,
+                r2_score         = EXCLUDED.r2_score,
+                feature_cols     = EXCLUDED.feature_cols,
+                train_start_date = EXCLUDED.train_start_date,
+                train_end_date   = EXCLUDED.train_end_date,
+                test_start_date  = EXCLUDED.test_start_date,
+                test_end_date    = EXCLUDED.test_end_date,
+                created_at       = NOW()
+    """)
+    try:
+        with engine.begin() as conn:
+            conn.execute(sql, {
+                "ticker": ticker,
+                "model_name": result.model_name,
+                "model_version": result.model_version,
+                "artifact": artifact_bytes,
+                "rmse": result.rmse,
+                "mae": result.mae,
+                "r2_score": result.r2,
+                "feature_cols": result.feature_cols,
+                "train_start_date": result.train_start,
+                "train_end_date": result.train_end,
+                "test_start_date": result.test_start,
+                "test_end_date": result.test_end,
+            })
+        logger.info("model_artifacts WRITE for %s (%s, %.2f KB)",
+                     ticker, result.model_name, len(artifact_bytes) / 1024)
+    except Exception as e:
+        logger.error("model_artifacts write error for %s: %s", ticker, e)
+
+
+def load_model_artifact(ticker: str) -> Optional[TrainResult]:
+    """
+    Load a persisted model for `ticker` if one exists and is not stale.
+    Uses the same staleness window as stock_cache (settings.cache_stale_hours)
+    so a persisted model and its underlying data go stale together.
+    Returns None on cache miss, staleness, or any read/deserialize error —
+    callers should treat None as "train fresh", never raise on this path.
+    """
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.cache_stale_hours)
+    query = text("""
+        SELECT artifact, created_at FROM model_artifacts WHERE ticker = :ticker
+    """)
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(query, {"ticker": ticker}).fetchone()
+            if row is None:
+                return None
+            artifact_bytes, created_at = row
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            if created_at < stale_cutoff:
+                logger.info("Persisted model STALE for %s (created %s)", ticker, created_at)
+                return None
+            result = joblib.load(io.BytesIO(bytes(artifact_bytes)))
+            logger.info("Persisted model LOADED for %s from DB", ticker)
+            return result
+    except Exception as e:
+        logger.error("model_artifacts read error for %s: %s", ticker, e)
+        return None

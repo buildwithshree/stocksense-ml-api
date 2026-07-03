@@ -27,6 +27,19 @@ class PredictionResponse(BaseModel):
     generated_at: datetime
 
 
+class TrainingStatusResponse(BaseModel):
+    """
+    Returned with HTTP 202 when /predict/{ticker} is hit for a ticker that
+    has no cached and no persisted model yet. Training has been kicked off
+    in the background — the client (Spring Boot) should poll /predict again
+    after check_again_in_seconds instead of the request blocking for minutes.
+    """
+    ticker: str
+    status: str                    # "training"
+    message: str
+    check_again_in_seconds: int
+
+
 class BacktestResponse(BaseModel):
     ticker: str
     model_name: str
