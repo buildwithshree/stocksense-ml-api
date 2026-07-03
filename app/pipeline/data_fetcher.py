@@ -1,21 +1,15 @@
-import requests
 import logging
-from typing import Tuple
-
+import requests
 import pandas as pd
-import yfinance as yf
+from datetime import datetime
+from typing import Tuple
 
 from app.config import settings
 from app.db.database import get_cached_ohlcv, write_ohlcv_cache
 
 logger = logging.getLogger(__name__)
 
-# Currency mapping by suffix — used to set correct currency in stock_cache
-SUFFIX_CURRENCY = {
-    ".NS": "INR",  # NSE India
-    ".BO": "INR",  # BSE India
-}
-
+SUFFIX_CURRENCY = {".NS": "INR", ".BO": "INR"}
 
 def detect_currency(ticker: str) -> str:
     for suffix, currency in SUFFIX_CURRENCY.items():
@@ -23,16 +17,8 @@ def detect_currency(ticker: str) -> str:
             return currency
     return "USD"
 
-
 def fetch_ohlcv(ticker: str) -> Tuple[pd.DataFrame, str]:
-    """
-    Returns (OHLCV DataFrame, currency).
-    Strategy:
-      1. Check stock_cache — return if fresh
-      2. Fetch from yfinance — write to cache — return
-    Raises ValueError if ticker is invalid or insufficient data.
-    """
-    ticker = ticker.upper()
+    ticker = ticker.upper().strip()
     currency = detect_currency(ticker)
 
     # 1. Cache check
@@ -40,44 +26,65 @@ def fetch_ohlcv(ticker: str) -> Tuple[pd.DataFrame, str]:
     if cached is not None and len(cached) >= 50:
         return cached, currency
 
-    # 2. Live fetch
-    logger.info("Fetching live OHLCV for %s from yfinance", ticker)
+    # 2. Alpha Vantage fetch
+    # Strip exchange suffix for AV — it uses base symbol only
+    av_symbol = ticker.split(".")[0]
+    logger.info("Fetching OHLCV for %s (AV symbol: %s)", ticker, av_symbol)
+
+    url = "https://www.alphavantage.co/query"
+    params = {
+        "function": "TIME_SERIES_DAILY_ADJUSTED",
+        "symbol": av_symbol,
+        "outputsize": "full",
+        "apikey": settings.alpha_vantage_key,
+    }
+
     try:
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        })
-        yf_ticker = yf.Ticker(ticker, session=session)
-        df = yf_ticker.history(
-            period=f"{settings.default_period_years}y",
-            interval="1d",
-            auto_adjust=True,
-            actions=False,
-        )
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
     except Exception as e:
-        raise ValueError(f"yfinance fetch failed for {ticker}: {e}")
+        raise ValueError(f"Alpha Vantage request failed for {ticker}: {e}")
 
-    if df is None or df.empty:
-        raise ValueError(f"No data returned from yfinance for ticker: {ticker}")
+    if "Note" in data:
+        raise ValueError("Alpha Vantage rate limit hit. Try again in 1 minute.")
 
-    # yfinance returns timezone-aware index — normalise to date only for DB
-    df.index = pd.to_datetime(df.index).tz_localize(None)
-    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    if "Error Message" in data:
+        raise ValueError(f"Invalid ticker {ticker}: {data['Error Message']}")
+
+    ts = data.get("Time Series (Daily)")
+    if not ts:
+        raise ValueError(f"No data returned from Alpha Vantage for ticker: {ticker}")
+
+    rows = []
+    for date_str, vals in ts.items():
+        rows.append({
+            "Date": pd.to_datetime(date_str),
+            "Open":   float(vals["1. open"]),
+            "High":   float(vals["2. high"]),
+            "Low":    float(vals["3. low"]),
+            "Close":  float(vals["5. adjusted close"]),
+            "Volume": int(vals["6. volume"]),
+        })
+
+    df = pd.DataFrame(rows).set_index("Date").sort_index()
+    df = df.dropna()
 
     if len(df) < 50:
         raise ValueError(f"Insufficient data for {ticker}: only {len(df)} rows")
 
-    # 3. Write to cache
     write_ohlcv_cache(ticker, df, currency)
-
-    logger.info("Fetched %d rows for %s", len(df), ticker)
+    logger.info("Fetched %d rows for %s via Alpha Vantage", len(df), ticker)
     return df, currency
 
 
 def get_company_name(ticker: str) -> str:
-    """Best-effort company name fetch. Falls back to ticker string."""
     try:
-        info = yf.Ticker(ticker).info
-        return info.get("longName") or info.get("shortName") or ticker
+        av_symbol = ticker.split(".")[0]
+        url = "https://www.alphavantage.co/query"
+        params = {"function": "OVERVIEW", "symbol": av_symbol, "apikey": settings.alpha_vantage_key}
+        resp = requests.get(url, params=params, timeout=10)
+        data = resp.json()
+        return data.get("Name") or ticker
     except Exception:
         return ticker
