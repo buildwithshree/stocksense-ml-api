@@ -29,8 +29,8 @@ class TrainResult:
     scaler: StandardScaler
     model: object
     feature_cols: list[str]
-    rmse: float
-    mae: float
+    rmse: float             # RMSE in RETURN space (e.g. 0.02 = 2% typical error)
+    mae: float               # MAE in RETURN space
     r2: float
     training_time_ms: int
     model_size_mb: float
@@ -62,7 +62,7 @@ def select_model_name(n_rows: int) -> str:
 
 
 def train_and_evaluate(
-    df_features,       # engineered DataFrame with Target column
+    df_features,       # engineered DataFrame with Target/Target_return columns
     feature_cols: list[str],
     ticker: str,
     force_model: Optional[str] = None,
@@ -71,12 +71,13 @@ def train_and_evaluate(
     Full training pipeline:
     1. Scale features
     2. TimeSeriesSplit (no data leakage)
-    3. Train selected model
+    3. Train selected model on Target_return (NOT absolute price — see
+       engineer.py module docstring for why)
     4. Evaluate on held-out test fold
-    5. Return TrainResult with all metrics
+    5. Return TrainResult with all metrics (rmse/mae are in return-space)
     """
     X = df_features[feature_cols].values
-    y = df_features["Target"].values
+    y = df_features["Target_return"].values   # <-- the actual fix: was "Target"
     dates = df_features.index
 
     n_rows = len(X)
@@ -114,7 +115,7 @@ def train_and_evaluate(
     )
     training_ms = int((time.time() - t0) * 1000)
 
-    # ── Evaluate ──────────────────────────────────────────────────────────
+    # ── Evaluate (all in return-space, e.g. RMSE=0.02 means ~2% typical error) ─
     rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
     mae  = float(mean_absolute_error(y_test, y_pred))
     r2   = float(r2_score(y_test, y_pred))
@@ -123,7 +124,7 @@ def train_and_evaluate(
     model_size_mb = _estimate_size_mb(model)
 
     logger.info(
-        "%s trained in %dms | RMSE=%.4f MAE=%.4f R2=%.4f size=%.2fMB",
+        "%s trained in %dms | RMSE=%.4f MAE=%.4f R2=%.4f size=%.2fMB (return-space)",
         model_name, training_ms, rmse, mae, r2, model_size_mb
     )
 

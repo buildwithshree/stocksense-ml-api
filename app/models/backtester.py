@@ -16,15 +16,18 @@ def run_backtest(df_raw, ticker: str) -> dict:
     Walk-forward backtest:
     For each day in the test window:
       - Use all prior data to train
-      - Predict next day close
-      - Compare with actual
-    Returns aggregated metrics.
+      - Predict next day RETURN (not absolute price — model trains on
+        Target_return, see selector.py / engineer.py for why)
+      - Compare with actual return
+    Returns aggregated metrics. average_error / max_error are in
+    return-space (e.g. 0.02 = 2 percentage points of error), consistent
+    with rmse/mae reported elsewhere in the system.
     """
     df = engineer_features(df_raw)
     feature_cols = get_feature_columns(df)
 
     X = df[feature_cols].values
-    y = df["Target"].values
+    y = df["Target_return"].values   # was "Target" — must match what the model trains on
     dates = df.index
 
     tscv = TimeSeriesSplit(n_splits=5)
@@ -33,19 +36,12 @@ def run_backtest(df_raw, ticker: str) -> dict:
 
     errors = []
     direction_correct = 0
-    prev_actual = None
+    direction_total = 0
 
     t0 = time.time()
     for i in test_idx:
         if i < 50:
             continue
-        X_train_bt = X[:i]
-        y_train_bt = y[:i]
-
-        from sklearn.preprocessing import StandardScaler
-        sc = StandardScaler()
-        X_tr_s = sc.fit_transform(X_train_bt)
-        X_te_s = sc.transform(X[i:i+1])
 
         result = train_and_evaluate(
             df.iloc[:i],
@@ -54,22 +50,20 @@ def run_backtest(df_raw, ticker: str) -> dict:
             force_model="XGBoost",   # Use XGBoost for consistent backtest baseline
         )
 
-        pred = result.scaler.transform(X[i:i+1])
-        from sklearn.linear_model import Ridge
-        # Use already-trained model from result
-        y_pred = result.model.predict(pred)[0]
-        y_actual = y[i]
+        X_next = result.scaler.transform(X[i:i+1])
+        y_pred   = float(result.model.predict(X_next)[0])   # predicted return
+        y_actual = float(y[i])                                # actual return
 
         error = abs(y_pred - y_actual)
         errors.append(error)
 
-        if prev_actual is not None:
-            pred_dir   = y_pred > prev_actual
-            actual_dir = y_actual > prev_actual
-            if pred_dir == actual_dir:
-                direction_correct += 1
-
-        prev_actual = y_actual
+        # Direction is now trivial and correct: a return's own sign IS its
+        # direction — no need to compare against a separate previous price.
+        pred_dir   = y_pred > 0
+        actual_dir = y_actual > 0
+        if pred_dir == actual_dir:
+            direction_correct += 1
+        direction_total += 1
 
     elapsed_ms = int((time.time() - t0) * 1000)
 
@@ -79,19 +73,19 @@ def run_backtest(df_raw, ticker: str) -> dict:
     test_days = len(errors)
     avg_error = float(np.mean(errors))
     max_error = float(np.max(errors))
-    dir_acc   = round((direction_correct / max(test_days - 1, 1)) * 100, 2)
+    dir_acc   = round((direction_correct / max(direction_total, 1)) * 100, 2)
 
     logger.info(
-        "Backtest %s: %d days, avg_err=%.4f, dir_acc=%.2f%%",
-        ticker, test_days, avg_error, dir_acc
+        "Backtest %s: %d days, avg_err=%.4f (return-space), dir_acc=%.2f%%, elapsed=%dms",
+        ticker, test_days, avg_error, dir_acc, elapsed_ms
     )
 
     return {
         "ticker": ticker,
         "model_name": "XGBoost",
         "model_version": settings.model_version,
-        "average_error": round(avg_error, 4),
+        "average_error": round(avg_error, 6),
         "direction_accuracy": dir_acc,
-        "max_error": round(max_error, 4),
+        "max_error": round(max_error, 6),
         "test_days": test_days,
     }

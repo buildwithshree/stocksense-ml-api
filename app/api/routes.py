@@ -41,12 +41,14 @@ def predict(ticker: str, background_tasks: BackgroundTasks, response: Response):
     Main prediction endpoint called by Spring Boot.
     Flow:
       1. Fetch/cache OHLCV
-      2. Engineer features
+      2. Engineer features (model trains on Target_return, not absolute price
+         — see engineer.py docstring for why absolute price prediction fails
+         across a multi-decade, multi-price-regime training window)
       3. Resolve a trained model — in-memory cache -> persisted DB artifact ->
          cold (no model anywhere): kick off background training and return
          202 immediately instead of blocking the request for minutes.
-      4. Predict next-day close
-      5. Compute confidence interval + direction probability
+      4. Predict next-day RETURN, reconstruct absolute price from it
+      5. Compute confidence interval (in price-space) + direction probability
       6. Compute risk score
       7. Return canonical response
     """
@@ -113,28 +115,40 @@ def predict(ticker: str, background_tasks: BackgroundTasks, response: Response):
         )
 
     # ── 4. Predict ───────────────────────────────────────────────────────────
+    # Model was trained on Target_return (next-day % change), NOT absolute
+    # price — see engineer.py / selector.py for why. Raw model output here
+    # is a return like 0.012 (meaning +1.2%), not a dollar price.
     t_inf = time.time()
     last_features = df[feature_cols].iloc[-1:].values
     last_features_scaled = result.scaler.transform(last_features)
 
     try:
-        # LSTM requires sequence reshape — handled inside predict wrapper
-        predicted_close = float(_predict(result, last_features_scaled, df, feature_cols))
+        predicted_return = float(_predict(result, last_features_scaled, df, feature_cols))
     except Exception as e:
         logger.error("Inference failed for %s: %s", ticker, e)
         raise HTTPException(status_code=500, detail="Prediction inference failed")
 
     inference_ms = int((time.time() - t_inf) * 1000)
 
+    # Reconstruct absolute price from the predicted return — this is the
+    # actual fix. predicted_close is now anchored to TODAY's price level,
+    # regardless of what price regime the model was trained across.
+    predicted_close = round(last_close * (1 + predicted_return), 4)
+
     # ── 5. Confidence interval + direction probability ────────────────────────
-    residual_std = result.rmse   # RMSE used as std proxy for interval
-    confidence_lower = round(predicted_close - 1.96 * residual_std, 4)
-    confidence_upper = round(predicted_close + 1.96 * residual_std, 4)
+    # result.rmse is in RETURN-space (e.g. 0.02 = ~2% typical error), so the
+    # interval must be built in return-space FIRST, then converted to price —
+    # building it directly off predicted_close would silently mix units.
+    return_lower = predicted_return - 1.96 * result.rmse
+    return_upper = predicted_return + 1.96 * result.rmse
+    confidence_lower = round(last_close * (1 + return_lower), 4)
+    confidence_upper = round(last_close * (1 + return_upper), 4)
 
-    expected_move = round((predicted_close - last_close) / last_close * 100, 4)
+    expected_move = round(predicted_return * 100, 4)
 
-    # Direction probability: sigmoid-scaled from expected move
-    direction_prob = round(float(1 / (1 + np.exp(-expected_move * 10))), 3)
+    # Direction probability: sigmoid-scaled from the predicted return itself
+    # (already a small, stationary number — no need to re-derive from price)
+    direction_prob = round(float(1 / (1 + np.exp(-predicted_return * 50))), 3)
 
     # ── 6. Risk score ─────────────────────────────────────────────────────────
     risk_score, risk_label = compute_risk_score(df_raw, predicted_close, last_close)
@@ -148,7 +162,7 @@ def predict(ticker: str, background_tasks: BackgroundTasks, response: Response):
         company_name=company_name,
         currency=currency,
         last_close=round(last_close, 4),
-        predicted_close=round(predicted_close, 4),
+        predicted_close=predicted_close,
         expected_move_percent=expected_move,
         confidence_lower=confidence_lower,
         confidence_upper=confidence_upper,
@@ -157,7 +171,7 @@ def predict(ticker: str, background_tasks: BackgroundTasks, response: Response):
         risk_label=risk_label,
         model_name=result.model_name,
         model_version=result.model_version,
-        rmse=round(result.rmse, 4),
+        rmse=round(result.rmse, 6),   # return-space now — smaller numbers, more decimals kept
         inference_time_ms=inference_ms,
         top_features=result.feature_importances[:5],
         generated_at=datetime.now(timezone.utc),
@@ -211,6 +225,30 @@ def _train_and_persist(ticker: str, df, feature_cols: list[str]) -> None:
         except Exception as e:
             logger.warning("model_artifacts persist failed for %s: %s", ticker, e)
 
+        # Measure a REAL inference so model_metrics.inference_time_ms is a
+        # genuine number, not a placeholder — the DB has a CHECK constraint
+        # (chk_mm_inf_time) requiring this to be a real positive value, and
+        # a hardcoded 0 violated it, silently dropping every metrics row.
+        try:
+            last_features = df[feature_cols].iloc[-1:].values
+            last_features_scaled = result.scaler.transform(last_features)
+            t_inf = time.time()
+            if result.model_name == "LSTM":
+                import torch
+                SEQ_LEN = min(30, len(df) // 4)
+                seq_features = df[feature_cols].iloc[-SEQ_LEN:].values
+                seq_scaled = result.scaler.transform(seq_features)
+                tensor = torch.FloatTensor(seq_scaled).unsqueeze(0)
+                result.model.eval()
+                with torch.no_grad():
+                    result.model(tensor).item()
+            else:
+                result.model.predict(last_features_scaled)
+            measured_inference_ms = max(1, int((time.time() - t_inf) * 1000))
+        except Exception as e:
+            logger.warning("Inference timing probe failed for %s, defaulting to 1ms: %s", ticker, e)
+            measured_inference_ms = 1
+
         try:
             write_model_metrics({
                 "model_name":        result.model_name,
@@ -220,7 +258,7 @@ def _train_and_persist(ticker: str, df, feature_cols: list[str]) -> None:
                 "mae":               result.mae,
                 "r2_score":          result.r2,
                 "training_time_ms":  result.training_time_ms,
-                "inference_time_ms": 0,
+                "inference_time_ms": measured_inference_ms,
                 "model_size_mb":     result.model_size_mb,
                 "feature_count":     len(feature_cols),
                 "train_start_date":  result.train_start,
@@ -239,7 +277,11 @@ def _train_and_persist(ticker: str, df, feature_cols: list[str]) -> None:
 
 
 def _predict(result, X_scaled, df, feature_cols) -> float:
-    """Unified predict call — handles LSTM sequence reshaping if needed."""
+    """
+    Unified predict call — handles LSTM sequence reshaping if needed.
+    Returns a RETURN (e.g. 0.012 = +1.2%), not an absolute price — the
+    caller (predict()) is responsible for reconstructing price from it.
+    """
     model = result.model
 
     if result.model_name == "LSTM":
