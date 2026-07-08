@@ -10,6 +10,14 @@ logger = logging.getLogger(__name__)
 
 SUFFIX_CURRENCY = {".NS": "INR", ".BO": "INR"}
 
+# Twelve Data requires an explicit `exchange` param whenever a bare symbol
+# is ambiguous across multiple listings — confirmed by their own docs
+# ("if symbol is traded in multiple exchanges specify the desired one").
+# Stripping ".NS"/".BO" down to a bare symbol (e.g. "TCS") without this
+# was resolving to nothing on Twelve Data's end (404), since bare "TCS"
+# isn't uniquely resolvable without exchange context.
+SUFFIX_EXCHANGE = {".NS": "NSE", ".BO": "BSE"}
+
 BASE_URL = "https://api.twelvedata.com"
 
 
@@ -20,14 +28,21 @@ def detect_currency(ticker: str) -> str:
     return "USD"
 
 
+def _to_twelvedata_exchange(ticker: str) -> str | None:
+    """Returns the Twelve Data exchange code for suffixed tickers (NSE/BSE),
+    or None for plain US tickers where no exchange disambiguation is needed."""
+    for suffix, exchange in SUFFIX_EXCHANGE.items():
+        if ticker.upper().endswith(suffix):
+            return exchange
+    return None
+
+
 def _to_twelvedata_symbol(ticker: str) -> str:
     """
-    Twelve Data uses plain symbols for US equities (AAPL) and
-    'SYMBOL:EXCHANGE' or region suffixes for others. NSE/BSE tickers
-    keep their .NS/.BO suffix stripped and pass exchange separately
-    if ever needed — for now we only strip US-style suffixes since
-    that's what the system currently supports (ticker.split('.')[0]
-    mirrors the old Alpha Vantage behaviour so no caller code changes).
+    Twelve Data uses plain symbols for US equities (AAPL) and requires a
+    bare symbol + separate `exchange` param for NSE/BSE tickers (see
+    _to_twelvedata_exchange) rather than a combined 'SYMBOL:EXCHANGE'
+    string — .NS/.BO suffix is stripped here, exchange is passed alongside.
     """
     return ticker.split(".")[0]
 
@@ -43,7 +58,9 @@ def fetch_ohlcv(ticker: str) -> Tuple[pd.DataFrame, str]:
         return cached, currency
 
     td_symbol = _to_twelvedata_symbol(ticker)
-    logger.info("Fetching OHLCV for %s (Twelve Data symbol: %s)", ticker, td_symbol)
+    td_exchange = _to_twelvedata_exchange(ticker)
+    logger.info("Fetching OHLCV for %s (Twelve Data symbol: %s, exchange: %s)",
+                ticker, td_symbol, td_exchange or "default/US")
 
     params = {
         "symbol": td_symbol,
@@ -52,6 +69,8 @@ def fetch_ohlcv(ticker: str) -> Tuple[pd.DataFrame, str]:
                               # returns full history since listing anyway
         "apikey": settings.twelve_data_key,
     }
+    if td_exchange:
+        params["exchange"] = td_exchange
 
     try:
         resp = requests.get(f"{BASE_URL}/time_series", params=params, timeout=30)
@@ -108,11 +127,11 @@ def get_company_name(ticker: str) -> str:
     """
     try:
         td_symbol = _to_twelvedata_symbol(ticker)
-        resp = requests.get(
-            f"{BASE_URL}/quote",
-            params={"symbol": td_symbol, "apikey": settings.twelve_data_key},
-            timeout=10,
-        )
+        td_exchange = _to_twelvedata_exchange(ticker)
+        params = {"symbol": td_symbol, "apikey": settings.twelve_data_key}
+        if td_exchange:
+            params["exchange"] = td_exchange
+        resp = requests.get(f"{BASE_URL}/quote", params=params, timeout=10)
         data = resp.json()
         if data.get("status") == "error":
             return ticker
